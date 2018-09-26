@@ -1,0 +1,173 @@
+param(
+
+    $tableName = 'AZTable' ,
+    $storageAccount = 'StorageAccount',
+    $Sub = 'SubName'
+)
+
+$runbook = 'ScheduledStartStop_Parent'
+
+#Authentrication
+$connectionName = "AzureRunAsConnection"
+
+try
+{
+    # Get the connection "AzureRunAsConnection "
+    $servicePrincipalConnection = Get-AutomationConnection -Name $connectionName
+
+    "Logging in to Azure..."
+    Add-AzureRmAccount `
+        -ServicePrincipal `
+        -TenantId $servicePrincipalConnection.TenantId `
+        -ApplicationId $servicePrincipalConnection.ApplicationId `
+        -CertificateThumbprint $servicePrincipalConnection.CertificateThumbprint
+
+}
+catch
+{
+    if (!$servicePrincipalConnection)
+    {
+        $ErrorMessage = "Connection $connectionName not found."
+        throw $ErrorMessage
+    } else{
+        Write-Error -Message $_.Exception
+        throw $_.Exception
+    }
+}
+
+$sAccount =  Get-AzureRmStorageAccount | ?{ $_.StorageAccountName -eq $storageAccount }
+if ( !$sAccount )
+{
+    throw "Storage account [$storageAccount] is not present in current context."
+}
+$ctx = $sAccount.Context
+$table = Get-AzureStorageTable -Context $ctx -Name $tableName -ErrorAction SilentlyContinue
+if ( !$table )
+{
+    throw "Storage table [$tableName] does not exist in account [$storageAccount]."
+}
+
+$rows = Get-AzureStorageTableRowAll -table $table
+$schedules = $rows
+$now = Get-Date
+
+ForEach ($row in $rows)
+{
+    If ($row.Active -eq 'true' -and $row.rowkey -eq $Sub)
+    {
+        $RG = $row.PartitionKey
+        $eVm = $row.ExcludeVM
+        if ($eVM -ne "")
+        {
+            $ExcludeStartVM += $eVM +','
+            $ExcludeStopVM = $ExcludeStartVM
+        }
+
+        $Days  = $row.Days -split ','
+        $start = $row.UTCstart
+        $stop  = $row.UTCstop
+        $ScheduleKey = $row.Schedules
+
+        If ($row.Restart -eq $true)
+        {
+            $offHours = ($now.DayOfWeek -notin $Days)
+            $offHours = $offHours -or ($now.TimeOfDay -ge $start)
+            $offHours = $offHours -or ($now.TimeOfDay -le $stop)
+
+            write-output " Off Hours Restart [$RG] [$offHours]"
+
+            If ($offHours -eq "false")
+            {
+                $RestartRG += $RG +','
+            }
+        }
+        elseif (!($ScheduleKey))
+        {
+            $offHours = ($now.DayOfWeek -notin $Days)
+            $offHours = $offHours -or ($now.TimeOfDay -le $Start)
+            $offHours = $offHours -or ($now.TimeOfDay -ge $Stop)
+
+            write-output " Off Hours [$RG] [$offHours]"
+
+            If ($offHours -eq "True")
+            {
+                $StopRG += $RG +','
+            }
+            else
+            {
+                $StartRG += $RG +','
+            }
+        }
+        else
+        {
+            foreach ($schedule in $schedules)
+            {
+                if ($schedule.active -eq 'true' -and $schedule.rowkey -match $ScheduleKey)
+                {
+                    $VMsets = $schedule.VMsets
+                    $Days  = $schedule.Days -split ','
+                    $start = $schedule.UTCstart
+                    $stop  = $schedule.UTCstop
+
+                    $offHours = ($now.DayOfWeek -notin $Days)
+                    $offHours = $offHours -or ($now.TimeOfDay -le $Start)
+                    $offHours = $offHours -or ($now.TimeOfDay -ge $Stop)
+
+                    write-output " Off Hours [$ScheduleKey]/[$RG] [$offHours] for [$VMsets]"
+
+                    If ($offHours -eq "True")
+                    {
+                        $ScheduleStartVM += $VMsets +','
+                        $StopScheduleRG = $RG
+                    }
+                    else
+                    {
+                        $ScheduleStopVM += $VMsets +','
+                        $StartScheduleRG = $RG
+                    }
+
+                }
+            }
+            if ($StartScheduleRG -ne $null)
+            {
+                $StartRG = $StartScheduleRG+','+$StartRG
+            }
+            if ($StopScheduleRG -ne $null)
+            {
+                $StopRG = $StopScheduleRG+','+$StopRG
+            }
+        }
+    }
+}
+    
+$ExcludeStartVM += $ScheduleStartVM
+$ExcludeStopVM += $ScheduleStopVM
+$StopRG = $StopRG -replace ".$"
+$StartRG = $StartRG -replace ".$"
+$RestartRG = $RestartRG -replace ".$"
+$ExcludeStartVM = $ExcludeStartVM -replace ".$"
+$ExcludeStopVM = $ExcludeStopVM -replace ".$"
+
+
+if (!($StartRG)) { $StartRG = 'none'}
+if (!($StopRG)) { $StopRG = 'none'}
+if (!($RestartRG)) { $RestartRG = 'none'}
+
+$StartParam = @{"Action"="Start"}
+$StopParam = @{"Action"="Stop"}
+$RestartParam = @{"Action"="Restart"}
+$automationAccountName = Get-AutomationVariable -Name 'Internal_AutomationAccountName'
+$automationRG = Get-AutomationVariable -Name 'Internal_ResourceGroupName'
+
+# Set Automation Account Global Variables
+Set-AutomationVariable –Name 'External_ExcludeStartVMNames' –Value $excludeStartVM
+Set-AutomationVariable –Name 'External_ExcludeStopVMNames' -Value $excludeStopVM
+Set-AutomationVariable –Name 'External_Restart_ResourceGroupNames' –Value $RestartRG
+Set-AutomationVariable –Name 'External_Start_ResourceGroupNames' –Value $StartRG
+Set-AutomationVariable –Name 'External_Stop_ResourceGroupNames' –Value $StopRG
+
+
+# Start StartStopVm_parent runbbok for Stop/Start actions
+If ($StartRG -ne 'none') {Start-AzureRmAutomationRunbook -automationAccountName $automationAccountName -name $runbook  -ResourceGroupName $automationRG -Parameters $StartParam}
+If ($StopRG -ne 'none') {Start-AzureRmAutomationRunbook -automationAccountName $automationAccountName -name $runbook  -ResourceGroupName $automationRG -Parameters $StopParam}
+If ($RestartRG -ne 'none') {Start-AzureRmAutomationRunbook -automationAccountName $automationAccountName -name $runbook  -ResourceGroupName $automationRG -Parameters $RestartParam}
